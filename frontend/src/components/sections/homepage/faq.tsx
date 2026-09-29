@@ -129,21 +129,12 @@ const QA = [
 				<p>
 					Yes. The easiest way is to list directly on{' '}
 					<Link
-						href="https://app.rivrdex.io/"
+						href="https://rivrdex.io/docs/features/creating-pairs"
 						className="link link-primary"
 						target="_blank"
 						rel="noreferrer"
 					>
 						RivrDEX Mainnet
-					</Link>{' '}
-					(coming soon) or{' '}
-					<Link
-						href="https://stg-app.rivrdex.io/"
-						className="link link-primary"
-						target="_blank"
-						rel="noreferrer"
-					>
-						RivrDEX Testnet
 					</Link>{' '}
 					- the native DEX on Vara Network. After deploying your token, head to
 					RivrDEX, create a liquidity pool, and your token is tradeable. Anyone
@@ -226,21 +217,12 @@ const QA = [
 					Start by giving your token real utility or a compelling story. Share
 					it on X, crypto forums, and community chats. List it on{' '}
 					<Link
-						href="https://app.rivrdex.io/"
+						href="https://rivrdex.io/docs/features/creating-pairs"
 						className="link link-primary"
 						target="_blank"
 						rel="noreferrer"
 					>
 						RivrDEX Mainnet
-					</Link>{' '}
-					(coming soon) or{' '}
-					<Link
-						href="https://stg-app.rivrdex.io/"
-						className="link link-primary"
-						target="_blank"
-						rel="noreferrer"
-					>
-						RivrDEX Testnet
 					</Link>{' '}
 					so anyone can trade it instantly. Airdrops, early-holder rewards, and
 					partnerships are great ways to grow an initial community.

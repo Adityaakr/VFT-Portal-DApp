@@ -74,17 +74,6 @@ export function HeaderMenu({ className }: Props) {
 							className="flex-col items-start gap-2"
 						>
 							<span>List on RivrDEX Mainnet</span>
-							<span className="text-[10px]">(coming soon)</span>
-						</Link>
-					</DropdownMenuItem>
-
-					<DropdownMenuItem asChild>
-						<Link
-							href="https://stg-app.rivrdex.io/"
-							target="_blank"
-							rel="noreferrer"
-						>
-							List on RivrDEX Testnet
 						</Link>
 					</DropdownMenuItem>
 				</DropdownMenuContent>

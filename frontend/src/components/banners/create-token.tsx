@@ -25,23 +25,13 @@ export function CreateTokenBanner({ className }: Props) {
 							<p className="mt-4 leading-relaxed">
 								After launch, list your token on{' '}
 								<Link
-									href="https://app.rivrdex.io/"
+									href="https://rivrdex.io/docs/features/creating-pairs"
 									className="text-primary underline decoration-2 underline-offset-4 transition-opacity hover:opacity-80"
 									target="_blank"
 									rel="noreferrer"
 								>
 									RivrDEX Mainnet
-								</Link>{' '}
-								(coming soon) or{' '}
-								<Link
-									href="https://stg-app.rivrdex.io/"
-									className="text-primary underline decoration-2 underline-offset-4 transition-opacity hover:opacity-80"
-									target="_blank"
-									rel="noreferrer"
-								>
-									RivrDEX Testnet
-								</Link>{' '}
-								- the native DEX on Vara Network.
+								</Link>, the native DEX on Vara Network.
 							</p>
 						</div>
 						<CreateButtonLazy />
