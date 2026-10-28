@@ -90,12 +90,28 @@ pub async fn call(
     reply_deposit: u64,
     timeout: u32,
 ) -> Result<Vec<u8>, CallError> {
+    call_tracked(dest, payload, gas, value, reply_deposit, timeout, |_| ()).await
+}
+
+/// `call` that hands the queued message's id to `on_sent` before awaiting. What `on_sent`
+/// records is committed with the send, so `handle_reply` can book the outcome even if the
+/// continuation never runs.
+pub async fn call_tracked(
+    dest: ActorId,
+    payload: Vec<u8>,
+    gas: u64,
+    value: u128,
+    reply_deposit: u64,
+    timeout: u32,
+    on_sent: impl FnOnce(MessageId),
+) -> Result<Vec<u8>, CallError> {
     let future = msg::send_bytes_with_gas_for_reply(dest, payload, gas, value, 0)
         .map_err(|_| CallError::Send)?;
     if reply_deposit != 0 {
         exec::reply_deposit(future.waiting_reply_to, reply_deposit)
             .unwrap_or_else(|_| panic!("ReplyDepositFailed"));
     }
+    on_sent(future.waiting_reply_to);
     future
         .up_to(Some(timeout))
         .unwrap_or_else(|_| panic!("ReplyWaitFailed"))
@@ -290,12 +306,43 @@ pub async fn pair_add_liquidity(
 
 // ---------------------------------------------------------------- wVARA ("VftNativeExchange")
 
-pub async fn wvara_mint(wvara: ActorId, value: u128, g: &GasConfig) -> Result<(), CallError> {
-    call_null(wvara, "VftNativeExchange", "Mint", (), g.gas_for_token_ops, value, g).await
+pub async fn wvara_mint(
+    wvara: ActorId,
+    value: u128,
+    g: &GasConfig,
+    on_sent: impl FnOnce(MessageId),
+) -> Result<(), CallError> {
+    wvara_exchange(wvara, "Mint", encode_call("VftNativeExchange", "Mint", ()), value, g, on_sent).await
 }
 
-pub async fn wvara_burn(wvara: ActorId, amount: U256, g: &GasConfig) -> Result<(), CallError> {
-    call_null(wvara, "VftNativeExchange", "Burn", (amount,), g.gas_for_token_ops, 0, g).await
+pub async fn wvara_burn(
+    wvara: ActorId,
+    amount: U256,
+    g: &GasConfig,
+    on_sent: impl FnOnce(MessageId),
+) -> Result<(), CallError> {
+    wvara_exchange(wvara, "Burn", encode_call("VftNativeExchange", "Burn", (amount,)), 0, g, on_sent).await
+}
+
+async fn wvara_exchange(
+    wvara: ActorId,
+    method: &str,
+    payload: Vec<u8>,
+    value: u128,
+    g: &GasConfig,
+    on_sent: impl FnOnce(MessageId),
+) -> Result<(), CallError> {
+    let bytes = call_tracked(
+        wvara,
+        payload,
+        g.gas_for_token_ops,
+        value,
+        g.gas_for_reply_deposit,
+        g.reply_timeout,
+        on_sent,
+    )
+    .await?;
+    check_null_reply("VftNativeExchange", method, &bytes)
 }
 
 // ---------------------------------------------------------------- value out

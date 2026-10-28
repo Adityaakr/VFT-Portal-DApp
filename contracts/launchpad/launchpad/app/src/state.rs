@@ -259,6 +259,22 @@ pub struct State {
     /// Value sends awaiting their reply: (launch, recipient, amount). A bounce (error reply,
     /// value returned) re-credits the amount as a pending payout.
     pub payouts_in_flight: HashMap<MessageId, (ActorId, ActorId, u128)>,
+    /// wVARA mints and burns awaiting their reply: (launch, operation, amount). They are booked
+    /// in `handle_reply`, which runs even when the sending continuation is starved of gas, so a
+    /// mint can never sit unbooked in the shared wVARA balance.
+    pub wvara_in_flight: HashMap<MessageId, (ActorId, WvaraOp, u128)>,
+    /// Alignment actions taken per graduating launch; see `MAX_ALIGN_ROUNDS`.
+    pub align_rounds: HashMap<ActorId, u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WvaraOp {
+    /// Pool VARA wrapped at `WrapVara`.
+    Wrap,
+    /// Pool VARA unwrapped back into escrow by `Unwind`.
+    Unwrap,
+    /// Leftover wVARA burned at `Settle` as protocol revenue.
+    Recover,
 }
 
 impl State {
@@ -275,6 +291,8 @@ impl State {
             total_liabilities: 0,
             wvara_expected: 0,
             payouts_in_flight: HashMap::new(),
+            wvara_in_flight: HashMap::new(),
+            align_rounds: HashMap::new(),
         }
     }
 
@@ -286,13 +304,46 @@ impl State {
         self.owe(amount);
     }
 
-    /// Called from `handle_reply`: settles a tracked value send.
-    pub fn on_payout_reply(&mut self, reply_to: MessageId, bounced: bool) {
+    /// Called from `handle_reply`: settles a tracked value send or wVARA operation. An error
+    /// reply means the operation was reverted (and any value returned), so nothing is booked.
+    pub fn on_reply(&mut self, reply_to: MessageId, is_error: bool) {
         if let Some((token, to, amount)) = self.payouts_in_flight.remove(&reply_to) {
-            if bounced {
+            if is_error {
                 self.credit_payout(token, to, amount);
             }
         }
+        if let Some((token, op, amount)) = self.wvara_in_flight.remove(&reply_to) {
+            if !is_error {
+                self.book_wvara_op(token, op, amount);
+            }
+        }
+    }
+
+    fn book_wvara_op(&mut self, token: ActorId, op: WvaraOp, amount: u128) {
+        match op {
+            WvaraOp::Wrap => {
+                self.wvara_expected += amount;
+                self.settle(amount);
+                let l = self.launch_mut(&token);
+                l.wrapped = true;
+                l.escrow -= amount;
+            }
+            WvaraOp::Unwrap => {
+                self.wvara_expected = self.wvara_expected.saturating_sub(amount);
+                let l = self.launch_mut(&token);
+                l.wrapped = false;
+                l.escrow += amount;
+                self.owe(amount);
+            }
+            WvaraOp::Recover => {
+                self.launch_mut(&token).protocol_fees += amount;
+                self.owe(amount);
+            }
+        }
+    }
+
+    pub fn wvara_op_pending(&self, token: &ActorId) -> bool {
+        self.wvara_in_flight.values().any(|(t, _, _)| t == token)
     }
 
     pub fn launch_mut(&mut self, token: &ActorId) -> &mut Launch {
@@ -393,6 +444,46 @@ mod tests {
             stuck: true,
             expires_at: 0,
         }
+    }
+
+    /// Every field zero, empty or the first variant.
+    fn zeroed<T: Decode>() -> T {
+        T::decode(&mut &[0u8; 4096][..]).unwrap()
+    }
+
+    #[test]
+    fn wvara_ops_are_booked_by_their_reply() {
+        let token = ActorId::from(7u64);
+        let mut st = State::new(zeroed(), ActorId::zero());
+        let mut launch: Launch = zeroed();
+        launch.escrow = 1_000;
+        st.launches.insert(token, launch);
+        st.owe(1_000);
+        let (mint, failed, burn, recover) =
+            (MessageId::from(1u64), MessageId::from(2u64), MessageId::from(3u64), MessageId::from(4u64));
+
+        st.wvara_in_flight.insert(failed, (token, WvaraOp::Wrap, 600));
+        assert!(st.wvara_op_pending(&token));
+        st.on_reply(failed, true);
+        assert!(!st.wvara_op_pending(&token) && !st.launch(&token).wrapped, "a reverted mint books nothing");
+
+        st.wvara_in_flight.insert(mint, (token, WvaraOp::Wrap, 600));
+        st.on_reply(mint, false);
+        let l = st.launch(&token);
+        assert!(l.wrapped);
+        assert_eq!((l.escrow, st.wvara_expected, st.total_liabilities), (400, 600, 400));
+
+        st.wvara_in_flight.insert(burn, (token, WvaraOp::Unwrap, 600));
+        st.on_reply(burn, false);
+        let l = st.launch(&token);
+        assert!(!l.wrapped);
+        assert_eq!((l.escrow, st.wvara_expected, st.total_liabilities), (1_000, 0, 1_000));
+
+        st.wvara_in_flight.insert(recover, (token, WvaraOp::Recover, 50));
+        st.on_reply(recover, false);
+        assert_eq!((st.launch(&token).protocol_fees, st.total_liabilities), (50, 1_050));
+        st.on_reply(recover, false);
+        assert_eq!(st.total_liabilities, 1_050, "a reply is booked once");
     }
 
     #[test]

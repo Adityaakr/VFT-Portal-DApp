@@ -68,4 +68,19 @@ All 11 plan items are implemented in `contracts/launchpad`. Regression tests liv
 
 Real node: `devnet` deploy + `smoke.ts` pass against a local `gear --dev` 1.10 node using RPC gas estimation (launch, buy, sell, sell-out, all graduation steps, LP burned). That run is what exposed the gas-estimation problem in item 2.
 
+### Post-remediation review (2026-10-28)
+A fresh review of the remediated contract found further issues, fixed as below. The smoke run above was repeated on the fixed build and passes.
+
+| Issue | Fix | Test |
+|---|---|---|
+| wVARA was tracked by one shared balance: a wrap whose continuation trapped, or whose reply timed out but landed, left its mint unbooked, so another launch's `Settle` could burn it as leftover and the program end a pool short. `Settle`'s own burn had the same gap on retry | Mints and burns are recorded in `wvara_in_flight` when sent and booked in `#[handle_reply]`, which runs on the reply deposit whatever the continuation does; `Settle` measures leftover only while nothing is in flight | `wvara_ops_are_booked_by_their_reply` (unit). gtest could not produce the starved window for `WrapVara`: below the threshold the whole message reverts |
+| A pair seeded deep and far off the curve price could never be aligned, and AlignPrice is not unwindable, so the escrow froze | After `MAX_ALIGN_ROUNDS` (8) actions, or once the budget is spent, the launch lists at the pool's own price | `deep_mispriced_seed_still_lists` (fails with the cap removed) |
+| A launch starved after its spawn cleared the creator's cooldown, so the reserve could be drained one existential deposit at a time | The trap hook keeps the cooldown | (one-line change) |
+| `pair_created_by_us` was set after the `CreatePair` reply, so a starved continuation left the pair fee on the reserve | Set before the send; cleared only if the send failed or was rejected | (one-line change) |
+| A `Decode` error on a trade transfer reverted the trade, though the VFT had replied with success | Treated like a timeout: the trade is marked stuck and reconciled from balances | existing trade tests |
+| `NameTaken` normalised names differently from `Launch` | One `name_key` function | `launch_rejects_duplicate_names_case_insensitively` |
+| `QuoteSell` capped at the escrow while `Sell` rejects such a sale | The quote returns zero output | — |
+
+Not changed: `Launch` still reports `Ok` when the creator's first buy failed (the buy's own events and the refund show it), and `validate_config` still duplicates the curve derivation.
+
 Still required before mainnet: a public-testnet run with the real keeper, including forced failures (gtest delivers replies in-block, so timeouts and lost replies were not exercised end to end); cross-machine confirmation of the wasm hashes; and the external audit.

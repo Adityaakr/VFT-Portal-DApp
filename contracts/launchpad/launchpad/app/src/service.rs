@@ -252,6 +252,11 @@ fn curve_params_for(config: &Config) -> (curve::CurveParams, u128, U256) {
     (params, pool_vara, pool_tokens)
 }
 
+/// Uniqueness key of a launch name: inner whitespace collapsed, ASCII case folded.
+fn name_key(name: &str) -> String {
+    name.split_ascii_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+}
+
 fn fail_reason(err: &CallError) -> String {
     String::from(err.describe())
 }
@@ -260,7 +265,7 @@ fn fail_reason(err: &CallError) -> String {
 fn step_calls(step: GradStep, g: &GasConfig) -> Vec<u64> {
     let t = g.gas_for_token_ops;
     match step {
-        GradStep::WrapVara => vec![t, t],
+        GradStep::WrapVara => vec![t],
         GradStep::FindOrCreatePair => vec![t, g.gas_for_create_pair, t, t],
         GradStep::ApproveToken | GradStep::ApproveWvara => vec![t],
         GradStep::AlignPrice => vec![t, t, t, g.gas_for_add_liquidity],
@@ -290,6 +295,10 @@ fn gas_needed(g: &GasConfig, calls: &[u64]) -> u64 {
 /// launches go to a successor launchpad.
 pub const MAX_LAUNCHES: usize = 10_000;
 pub const MAX_PAGE: u32 = 100;
+/// Alignment actions a launch takes before it lists at the pool's own price instead. A pool
+/// seeded deep and far off the curve price cannot be moved with our budget, and AlignPrice is
+/// past the unwindable steps, so without a bound such a seed would freeze the escrow for good.
+pub const MAX_ALIGN_ROUNDS: u8 = 8;
 
 /// Most gas one message may carry on Vara (the per-block limit).
 pub const MAX_MESSAGE_GAS: u64 = 750_000_000_000;
@@ -466,12 +475,7 @@ impl<'a> LaunchpadService<'a> {
             if !printable(&meta.name) || !printable(&meta.symbol) {
                 panic!("BadName")
             }
-            let name_key = meta
-                .name
-                .split_ascii_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_ascii_lowercase();
+            let name_key = name_key(&meta.name);
             if name_key.is_empty() || meta.name.len() > 64 {
                 panic!("BadName")
             }
@@ -555,11 +559,11 @@ impl<'a> LaunchpadService<'a> {
         });
 
         // A trap after the spawn await (before the launch is recorded) frees the name and makes
-        // the creator's VARA claimable again.
+        // the creator's VARA claimable again. The cooldown stays: the spawn may have happened
+        // and cost the reserve its existential deposit, so starving it must not be repeatable.
         let (hook_name, hook_creator) = (name_key.clone(), creator);
         self.on_trap(move |st| {
             st.names.remove(&hook_name);
-            st.last_launch_by_creator.remove(&hook_creator);
             if value > 0 {
                 st.credit_payout(ActorId::zero(), hook_creator, value);
             }
@@ -771,15 +775,12 @@ impl<'a> LaunchpadService<'a> {
         let me = exec::program_id();
         match wire::vft_transfer_from(token, seller, me, amount, &gas).await {
             Ok(true) => Ok(self.commit_trade(token, &pending)),
-            Ok(false)
-            | Err(CallError::Send)
-            | Err(CallError::Reply)
-            | Err(CallError::Decode)
-            | Err(CallError::Arithmetic) => {
+            Ok(false) | Err(CallError::Send) | Err(CallError::Reply) | Err(CallError::Arithmetic) => {
                 self.with_state_mut(|st| revert_trade(st, token, &pending));
                 Err(LaunchpadError::TransferFailed)
             }
-            Err(CallError::Timeout) => {
+            // An undecodable success reply may still mean the transfer happened: reconcile.
+            Err(CallError::Timeout) | Err(CallError::Decode) => {
                 self.with_state_mut(|st| mark_stuck(st, token));
                 self.emit_event(Event::TradeStuck { token, seq: pending.seq }).expect("event");
                 Err(LaunchpadError::TradeStuck)
@@ -890,7 +891,7 @@ impl<'a> LaunchpadService<'a> {
         let me = exec::program_id();
         let mut repeat = false;
         let outcome: Result<(), CallError> = match step {
-            GradStep::WrapVara => self.step_wrap(&launch, me, &gas).await,
+            GradStep::WrapVara => self.step_wrap(&launch, &gas).await,
             GradStep::FindOrCreatePair => self.step_find_or_create_pair(&launch, &gas).await,
             GradStep::ApproveToken => wire::vft_approve(token, launch.pair, launch.pool_tokens, &gas)
                 .await
@@ -971,9 +972,8 @@ impl<'a> LaunchpadService<'a> {
     pub async fn unwind(&mut self, token: ActorId) -> Result<(), LaunchpadError> {
         ensure_no_value();
         let gas = self.gas();
-        let calls = [gas.gas_for_token_ops, gas.gas_for_token_ops];
-        let (launch, expected) = self.with_state_mut(|st| {
-            let expected = st.wvara_expected;
+        let calls = [gas.gas_for_token_ops];
+        let launch = self.with_state_mut(|st| {
             let launch = st.launch_mut(&token);
             let timeout = launch.graduation_timeout_blocks;
             let now = exec::block_height();
@@ -991,11 +991,10 @@ impl<'a> LaunchpadService<'a> {
             }
             launch.lock = true;
             launch.lock_expires_at = lock_deadline(now, calls.len(), &gas);
-            (launch.clone(), expected)
+            launch.clone()
         });
         self.on_trap(move |st| st.launch_mut(&token).lock = false);
-        let me = exec::program_id();
-        let result = self.unwind_wrapped(&launch, me, expected, &gas).await;
+        let result = self.unwind_wrapped(&launch, &gas).await;
         self.with_state_mut(|st| st.launch_mut(&token).lock = false);
         result.map_err(|err| LaunchpadError::GraduationFailed {
             step: launch.step,
@@ -1130,7 +1129,8 @@ impl<'a> LaunchpadService<'a> {
         self.with_state(|st| {
             let launch = st.launch(&token);
             let gross = curve::sell_vara_out(launch.virtual_vara, launch.virtual_tokens, tokens_in);
-            let gross = gross.min(U256::from(launch.escrow)).low_u128();
+            // `sell` rejects more than the escrow holds (EscrowExhausted); quote nothing for it.
+            let gross = if gross > U256::from(launch.escrow) { 0 } else { gross.low_u128() };
             let split = curve::split_fee(gross, launch.fee_bps, launch.creator_fee_bps);
             let vs = launch.virtual_vara - U256::from(gross);
             let vt = launch.virtual_tokens + tokens_in;
@@ -1196,7 +1196,7 @@ impl<'a> LaunchpadService<'a> {
 
     #[export]
     pub fn name_taken(&self, name: String) -> bool {
-        self.with_state(|st| st.names.contains(&name.trim().to_lowercase()))
+        self.with_state(|st| st.names.contains(&name_key(&name)))
     }
 
     // ------------------------------------------------------------------ admin
@@ -1296,16 +1296,13 @@ impl<'a> LaunchpadService<'a> {
         }
         match wire::vft_transfer(token, buyer, pending.tokens, &gas).await {
             Ok(true) => Ok(self.commit_trade(token, &pending)),
-            Ok(false)
-            | Err(CallError::Send)
-            | Err(CallError::Reply)
-            | Err(CallError::Decode)
-            | Err(CallError::Arithmetic) => {
+            Ok(false) | Err(CallError::Send) | Err(CallError::Reply) | Err(CallError::Arithmetic) => {
                 self.with_state_mut(|st| revert_trade(st, token, &pending));
                 self.pay(token, buyer, pending.vara_gross);
                 Err(LaunchpadError::TransferFailed)
             }
-            Err(CallError::Timeout) => {
+            // An undecodable success reply may still mean the transfer happened: reconcile.
+            Err(CallError::Timeout) | Err(CallError::Decode) => {
                 self.with_state_mut(|st| mark_stuck(st, token));
                 self.emit_event(Event::TradeStuck { token, seq: pending.seq }).expect("event");
                 Err(LaunchpadError::TradeStuck)
@@ -1391,25 +1388,24 @@ impl<'a> LaunchpadService<'a> {
         receipt
     }
 
-    async fn step_wrap(&mut self, launch: &Launch, me: ActorId, gas: &GasConfig) -> Result<(), CallError> {
+    /// The mint is booked by `handle_reply` (see `State::wvara_in_flight`), so by the time this
+    /// continuation resumes it is either booked or was reverted.
+    async fn step_wrap(&mut self, launch: &Launch, gas: &GasConfig) -> Result<(), CallError> {
         if launch.wrapped {
             return Ok(());
         }
-        // A timed-out mint may still have gone through: trust the wVARA balance over our flag.
-        let held = wire::vft_balance_of(launch.addrs.wvara, me, gas).await?;
-        let expected = self.with_state(|st| st.wvara_expected);
-        let already = held >= U256::from(expected) + U256::from(launch.pool_vara);
-        if !already {
-            wire::wvara_mint(launch.addrs.wvara, launch.pool_vara, gas).await?;
+        if self.with_state(|st| st.wvara_op_pending(&launch.token)) {
+            return Err(CallError::Timeout);
         }
-        self.with_state_mut(|st| {
-            st.wvara_expected += launch.pool_vara;
-            st.settle(launch.pool_vara);
-            let l = st.launch_mut(&launch.token);
-            l.wrapped = true;
-            l.escrow -= launch.pool_vara;
-        });
-        Ok(())
+        let track = self.track_wvara(launch.token, WvaraOp::Wrap, launch.pool_vara);
+        wire::wvara_mint(launch.addrs.wvara, launch.pool_vara, gas, track).await
+    }
+
+    fn track_wvara(&self, token: ActorId, op: WvaraOp, amount: u128) -> impl FnOnce(MessageId) {
+        let state = Rc::clone(self.state);
+        move |id| {
+            state.borrow_mut().wvara_in_flight.insert(id, (token, op, amount));
+        }
     }
 
     async fn step_find_or_create_pair(&mut self, launch: &Launch, gas: &GasConfig) -> Result<(), CallError> {
@@ -1417,10 +1413,18 @@ impl<'a> LaunchpadService<'a> {
         let wvara = launch.addrs.wvara;
         let mut pair = wire::factory_get_pair(factory, wvara, launch.token, gas).await?;
         if pair.is_zero() {
-            wire::factory_create_pair(factory, wvara, launch.token, launch.pair_creation_fee, gas).await?;
             // The fee is paid from the operating reserve for now (escrow must keep covering every
             // sell-back in case graduation is unwound); Settle charges it to the graduation fee.
+            // Flagged before the await, so a continuation starved after the pair exists cannot
+            // drop the charge; only a send that never went out or was rejected clears it.
             self.with_state_mut(|st| st.launch_mut(&launch.token).pair_created_by_us = true);
+            let created = wire::factory_create_pair(factory, wvara, launch.token, launch.pair_creation_fee, gas).await;
+            if let Err(err) = created {
+                if matches!(err, CallError::Send | CallError::Reply) {
+                    self.with_state_mut(|st| st.launch_mut(&launch.token).pair_created_by_us = false);
+                }
+                return Err(err);
+            }
             pair = wire::factory_get_pair(factory, wvara, launch.token, gas).await?;
             if pair.is_zero() {
                 return Err(CallError::Reply);
@@ -1440,7 +1444,7 @@ impl<'a> LaunchpadService<'a> {
     /// step is finished: after deepening a dust pool it must run again to swap. Correcting a dust
     /// seed costs almost nothing; correcting an over-priced seed pulls the seeder's wVARA to us.
     async fn step_align_price(&mut self, launch: &Launch, gas: &GasConfig) -> Result<bool, CallError> {
-        if launch.liquidity_added {
+        if launch.liquidity_added || self.align_given_up(&launch.token) {
             return Ok(true);
         }
         let (r0, r1) = wire::pair_get_reserves(launch.pair, gas).await?;
@@ -1478,7 +1482,9 @@ impl<'a> LaunchpadService<'a> {
                 let dir = if wvara_in { wvara_in_dir } else { !wvara_in_dir };
                 let out = wire::pair_get_amount_out(launch.pair, amount_in, dir, gas).await?;
                 if amount_in.is_zero() || out.is_zero() {
-                    return Err(CallError::Reply);
+                    // Budget spent: list at the pool's price.
+                    self.with_state_mut(|st| st.align_rounds.insert(launch.token, MAX_ALIGN_ROUNDS));
+                    return Ok(true);
                 }
                 let min_out = out.saturating_mul(U256::from(98u32)) / U256::from(100u32);
                 let spent_token = if wvara_in { launch.addrs.wvara } else { launch.token };
@@ -1499,11 +1505,16 @@ impl<'a> LaunchpadService<'a> {
         })
         .expect("event");
         self.with_state_mut(|st| {
+            *st.align_rounds.entry(launch.token).or_default() += 1;
             let l = st.launch_mut(&launch.token);
             l.wvara_budget = wvara_budget;
             l.token_budget = token_budget;
         });
         Ok(finished)
+    }
+
+    fn align_given_up(&self, token: &ActorId) -> bool {
+        self.with_state(|st| st.align_rounds.get(token).is_some_and(|r| *r >= MAX_ALIGN_ROUNDS))
     }
 
     async fn step_add_liquidity(&mut self, launch: &Launch, me: ActorId, gas: &GasConfig) -> Result<(), CallError> {
@@ -1515,27 +1526,34 @@ impl<'a> LaunchpadService<'a> {
         }
         let (r0, r1) = wire::pair_get_reserves(launch.pair, gas).await?;
         let (rw, rt) = if launch.wvara_is_token0 { (r0, r1) } else { (r1, r0) };
-        // Deposit at the curve's final price, limited by what this launch still holds.
         let pv = U256::from(launch.pool_vara);
         let pt = launch.pool_tokens;
         if pv.is_zero() || pt.is_zero() {
             return Err(CallError::Arithmetic);
         }
-        let pct = |x: U256, p: u32| x.checked_mul(U256::from(p)).map(|v| v / U256::from(100u32));
-        let mut amount_w = launch.wvara_budget.min(pv);
-        let mut amount_t = amount_w.checked_mul(pt).ok_or(CallError::Arithmetic)? / pv;
-        if amount_t > launch.token_budget {
-            amount_t = launch.token_budget;
-            amount_w = amount_t.checked_mul(pv).ok_or(CallError::Arithmetic)? / pt;
-        }
-        if !rw.is_zero() && !rt.is_zero() {
+        // Deposit at the curve's final price, or at the pool's own once alignment gave up,
+        // limited by what this launch still holds.
+        let (price_w, price_t) = if rw.is_zero() || rt.is_zero() {
+            (pv, pt)
+        } else {
             // The pool must still be at the target price (AlignPrice ran just before).
             let lhs = rw.checked_mul(pt).ok_or(CallError::Arithmetic)?;
             let rhs = rt.checked_mul(pv).ok_or(CallError::Arithmetic)?;
             let diff = if lhs > rhs { lhs - rhs } else { rhs - lhs };
-            if diff.saturating_mul(U256::from(50u32)) > rhs {
+            if diff.saturating_mul(U256::from(50u32)) <= rhs {
+                (pv, pt)
+            } else if self.align_given_up(&launch.token) {
+                (rw, rt)
+            } else {
                 return Err(CallError::Reply); // >2 % off: retry re-aligns first
             }
+        };
+        let pct = |x: U256, p: u32| x.checked_mul(U256::from(p)).map(|v| v / U256::from(100u32));
+        let mut amount_w = launch.wvara_budget.min(pv);
+        let mut amount_t = amount_w.checked_mul(price_t).ok_or(CallError::Arithmetic)? / price_w;
+        if amount_t > launch.token_budget {
+            amount_t = launch.token_budget;
+            amount_w = amount_t.checked_mul(price_w).ok_or(CallError::Arithmetic)? / price_t;
         }
         // AlignPrice's swap spends part of the step 3-4 approvals; approve the exact deposit.
         wire::vft_approve(launch.token, launch.pair, amount_t, gas).await?;
@@ -1635,14 +1653,17 @@ impl<'a> LaunchpadService<'a> {
         let minters = wire::vft_role_holders(launch.token, "Minters", gas).await?;
         let burners = wire::vft_role_holders(launch.token, "Burners", gas).await?;
         let renounced = admins.is_empty() && minters.is_empty() && burners.is_empty();
-        // wVARA not taken by the pool (imbalanced listing) comes back as protocol revenue.
+        // wVARA not taken by the pool (imbalanced listing) comes back as protocol revenue. The
+        // surplus is only measurable while no mint or burn is waiting to be booked.
+        if self.with_state(|st| !st.wvara_in_flight.is_empty()) {
+            return Err(CallError::Timeout);
+        }
         let held = wire::vft_balance_of(launch.addrs.wvara, me, gas).await?;
         let expected = U256::from(self.with_state(|st| st.wvara_expected));
-        let mut recovered: u128 = 0;
         if held > expected {
-            let leftover = held - expected;
-            wire::wvara_burn(launch.addrs.wvara, leftover, gas).await?;
-            recovered = leftover.low_u128();
+            let leftover = (held - expected).low_u128();
+            let track = self.track_wvara(launch.token, WvaraOp::Recover, leftover);
+            wire::wvara_burn(launch.addrs.wvara, U256::from(leftover), gas, track).await?;
         }
         // Curve tokens that did not fit the pool (rounding, or a re-aligned seed) are burned to
         // RivrDEX's dead address so nothing is stranded in the launchpad.
@@ -1660,34 +1681,22 @@ impl<'a> LaunchpadService<'a> {
             let pair_fee = if l.pair_created_by_us { l.pair_creation_fee.min(l.escrow) } else { 0 };
             l.escrow -= pair_fee;
             // What is left of the graduation fee becomes protocol revenue.
-            l.protocol_fees += l.escrow + recovered;
+            l.protocol_fees += l.escrow;
             l.escrow = 0;
             st.settle(pair_fee);
-            st.owe(recovered);
         });
         Ok(())
     }
 
-    /// Pulls the pool VARA back out of wVARA. Trusts the wVARA balance over the `wrapped` flag,
-    /// so a mint that executed after its reply timed out is recovered too.
-    async fn unwind_wrapped(&mut self, launch: &Launch, me: ActorId, expected: u128, gas: &GasConfig) -> Result<(), CallError> {
-        let pool = U256::from(launch.pool_vara);
-        if launch.wrapped {
-            wire::wvara_burn(launch.addrs.wvara, pool, gas).await?;
-            self.with_state_mut(|st| {
-                st.wvara_expected = st.wvara_expected.saturating_sub(launch.pool_vara);
-                let l = st.launch_mut(&launch.token);
-                l.wrapped = false;
-                l.escrow += launch.pool_vara;
-                st.owe(launch.pool_vara);
-            });
+    /// Pulls the pool VARA back out of wVARA; `handle_reply` books the burn.
+    async fn unwind_wrapped(&mut self, launch: &Launch, gas: &GasConfig) -> Result<(), CallError> {
+        if self.with_state(|st| st.wvara_op_pending(&launch.token)) {
+            return Err(CallError::Timeout);
+        }
+        if !self.with_state(|st| st.launch(&launch.token).wrapped) {
             return Ok(());
         }
-        let held = wire::vft_balance_of(launch.addrs.wvara, me, gas).await?;
-        if held >= U256::from(expected) + pool {
-            // Minted but never booked: escrow still counts it, so only the value moves back.
-            wire::wvara_burn(launch.addrs.wvara, pool, gas).await?;
-        }
-        Ok(())
+        let track = self.track_wvara(launch.token, WvaraOp::Unwrap, launch.pool_vara);
+        wire::wvara_burn(launch.addrs.wvara, U256::from(launch.pool_vara), gas, track).await
     }
 }

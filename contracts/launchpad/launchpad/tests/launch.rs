@@ -41,6 +41,9 @@ async fn launch_rejects_duplicate_names_case_insensitively() {
         .await;
     assert!(dup.is_err(), "duplicate name must be rejected");
     assert_eq!(h.svc().launches().await.unwrap().len(), 1);
+    // Same normalisation as `launch`: inner whitespace collapses.
+    h.launch("Beta Max", "BMAX").await;
+    assert!(h.svc().name_taken("beta   MAX".into()).await.unwrap());
 }
 
 #[tokio::test]

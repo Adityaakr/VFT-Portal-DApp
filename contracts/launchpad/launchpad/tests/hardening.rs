@@ -321,3 +321,37 @@ async fn launches_are_paged() {
     assert_eq!(s.launches_page(3, 2).await.unwrap(), Vec::<ActorId>::new());
     assert_eq!(s.launches_page(0, u32::MAX).await.unwrap().len(), 3);
 }
+
+async fn graduate_until(h: &Harness, token: ActorId, stop: GradStep) {
+    for _ in 0..60 {
+        let info = h.info(token).await;
+        if info.step == stop || info.state == LaunchState::Graduated {
+            return;
+        }
+        let _ = h.svc().graduate(token).with_params(|p| p.with_actor_id(actor(KEEPER))).await;
+    }
+    core::panic!("graduation stuck at {:?}", h.info(token).await.step);
+}
+
+/// A pair seeded deep and far above the curve price cannot be aligned with the launch's budget.
+/// Alignment gives up after a bounded number of rounds and the launch lists at the pool's own
+/// price instead of failing at AddLiquidity forever with its escrow locked.
+#[tokio::test]
+async fn deep_mispriced_seed_still_lists() {
+    let h = setup().await;
+    let token = h.launch("Deep Seed", "DEEP").await;
+    h.buy(token, BUYER2, vara(300)).await;
+    let seed_tokens = vft_balance(h.system(), token, actor(BUYER2));
+    let pair = seed_pair_raw(&h, BUYER2, token, U256::from(vara(200_000)), seed_tokens);
+    h.buy(token, BUYER, vara(1_000)).await;
+    assert_eq!(h.info(token).await.state, LaunchState::Ready);
+
+    graduate_until(&h, token, GradStep::Done).await;
+    let info = h.info(token).await;
+    assert_eq!(info.state, LaunchState::Graduated);
+    assert!(info.lp_burned > U256::zero(), "our deposit was made and its LP burned");
+    let (r0, r1) = pair_reserves(h.system(), pair);
+    println!("pool after listing {r0} / {r1}");
+    assert!(h.program_balance() >= h.liabilities().await);
+    assert_eq!(vft_balance(h.system(), h.wvara, h.launchpad_id), U256::zero());
+}

@@ -47,6 +47,6 @@ impl LaunchpadProgram {
         let (Ok(reply_to), Ok(code)) = (msg::reply_to(), msg::reply_code()) else {
             return;
         };
-        self.state.borrow_mut().on_payout_reply(reply_to, code.is_error());
+        self.state.borrow_mut().on_reply(reply_to, code.is_error());
     }
 }
